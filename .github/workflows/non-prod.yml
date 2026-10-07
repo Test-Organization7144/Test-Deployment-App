@@ -1,0 +1,45 @@
+name: Deploy Non-Production
+
+run-name: "${{ github.ref_name }} -> ${{ inputs.environment }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Select environment
+        required: true
+        type: choice
+        options:
+          - DEV
+          - TEST
+          - UAT
+
+permissions:
+  contents: read
+
+jobs:
+
+  run-dev:
+    name: DEV Deployment
+    if: ${{ inputs.environment == 'DEV' }}
+    uses: YOUR-ORG/Test-CI-Templates/.github/workflows/deploy-dev.yml@main
+    with:
+      release_tag: ${{ github.ref_name }}
+      repository: ${{ github.repository }}
+
+  run-test:
+    name: TEST Deployment
+    if: ${{ inputs.environment == 'TEST' }}
+    uses: YOUR-ORG/Test-CI-Templates/.github/workflows/deploy-test.yml@main
+    with:
+      release_tag: ${{ github.ref_name }}
+      repository: ${{ github.repository }}
+
+  run-uat:
+    name: UAT Deployment
+    if: ${{ inputs.environment == 'UAT' }}
+    uses: YOUR-ORG/Test-CI-Templates/.github/workflows/deploy-uat.yml@main
+    with:
+      release_tag: ${{ github.ref_name }}
+      repository: ${{ github.repository }}
+
