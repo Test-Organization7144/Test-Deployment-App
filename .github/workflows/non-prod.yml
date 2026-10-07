@@ -22,7 +22,7 @@ jobs:
   run-dev:
     name: DEV Deployment
     if: ${{ inputs.environment == 'DEV' }}
-    uses: YOUR-ORG/Test-CI-Templates/.github/workflows/deploy-dev.yml@main
+    uses: Test-Organization7144/Test-CI-Templates/.github/workflows/deploy-dev.yml@main
     with:
       release_tag: ${{ github.ref_name }}
       repository: ${{ github.repository }}
@@ -30,7 +30,7 @@ jobs:
   run-test:
     name: TEST Deployment
     if: ${{ inputs.environment == 'TEST' }}
-    uses: YOUR-ORG/Test-CI-Templates/.github/workflows/deploy-test.yml@main
+    uses: Test-Organization7144/Test-CI-Templates/.github/workflows/deploy-test.yml@main
     with:
       release_tag: ${{ github.ref_name }}
       repository: ${{ github.repository }}
@@ -38,7 +38,7 @@ jobs:
   run-uat:
     name: UAT Deployment
     if: ${{ inputs.environment == 'UAT' }}
-    uses: YOUR-ORG/Test-CI-Templates/.github/workflows/deploy-uat.yml@main
+    uses: Test-Organization7144/Test-CI-Templates/.github/workflows/deploy-uat.yml@main
     with:
       release_tag: ${{ github.ref_name }}
       repository: ${{ github.repository }}
