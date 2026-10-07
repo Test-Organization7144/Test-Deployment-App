@@ -1,0 +1,200 @@
+name: Release Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Jira release version
+        required: true
+        type: string
+        default: "1.0.0"
+
+      tag:
+        description: Git tag for the release
+        required: true
+        type: string
+        default: "v1.0.0"
+
+      ref:
+        description: Branch or existing tag to deploy from
+        required: true
+        type: string
+        default: "main"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-build-${{ github.repository }}-${{ inputs.version }}
+  cancel-in-progress: false
+
+jobs:
+  release-build:
+    name: Create Jira Release
+    runs-on: ubuntu-latest
+
+    env:
+      VERSION: ${{ inputs.version }}
+      TAG: ${{ inputs.tag }}
+      REPOSITORY: ${{ github.repository }}
+      REF: ${{ inputs.ref }}
+      JIRA_URL: https://ranjith-kumar-a.atlassian.net
+
+    steps:
+
+      # ---------------------------------------------------------------
+      # 1. Checkout the workflow source
+      #
+      # The workflow runs from the branch/tag selected when manually
+      # starting the GitHub Actions workflow.
+      #
+      # The deployment REF is independent and comes from inputs.ref.
+      # ---------------------------------------------------------------
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ---------------------------------------------------------------
+      # 2. Show release information
+      # ---------------------------------------------------------------
+
+      - name: Show release information
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "========================================"
+          echo "Release Build"
+          echo "========================================"
+
+          echo "Repository        : ${REPOSITORY}"
+          echo "Version           : ${VERSION}"
+          echo "Tag               : ${TAG}"
+          echo "Deployment REF    : ${REF}"
+
+          echo "Workflow Source   : ${{ github.ref_name }}"
+          echo "GitHub Ref        : ${{ github.ref }}"
+          echo "Ref Type          : ${{ github.ref_type }}"
+          echo "Commit SHA        : ${{ github.sha }}"
+
+          echo "========================================"
+
+      # ---------------------------------------------------------------
+      # 3. Validate deployment REF
+      #
+      # Supports:
+      #
+      #   main
+      #   develop
+      #   release/1.0.0
+      #   v1.0.0
+      #
+      # The deployment REF is independent from the workflow source.
+      # ---------------------------------------------------------------
+
+      - name: Validate deployment REF
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          echo "========================================"
+          echo "Validating deployment REF"
+          echo "========================================"
+          echo "Repository : ${REPOSITORY}"
+          echo "REF        : ${REF}"
+          echo "========================================"
+
+          if gh api \
+            "repos/${REPOSITORY}/git/ref/heads/${REF}" \
+            >/dev/null 2>&1; then
+
+            echo "REF '${REF}' found as a branch."
+
+          elif gh api \
+            "repos/${REPOSITORY}/git/ref/tags/${REF}" \
+            >/dev/null 2>&1; then
+
+            echo "REF '${REF}' found as a tag."
+
+          else
+
+            echo "ERROR: REF '${REF}' was not found as a branch or tag."
+            exit 1
+
+          fi
+
+      # ---------------------------------------------------------------
+      # 4. Set up Python
+      # ---------------------------------------------------------------
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # ---------------------------------------------------------------
+      # 5. Install Python dependencies
+      # ---------------------------------------------------------------
+
+      - name: Install Python dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python -m pip install --upgrade pip
+
+          python -m pip install \
+            "requests>=2.32,<3"
+
+      # ---------------------------------------------------------------
+      # 6. Create Jira releases
+      #
+      # GitHub Custom Properties are read by create_release.py.
+      #
+      # Required:
+      #
+      #   jira_projects
+      #   workflow
+      #
+      # Optional:
+      #
+      #   deployment_type
+      #
+      # If deployment_type is not configured, the script defaults
+      # to "direct" so existing repositories continue to work.
+      #
+      # Direct example:
+      #
+      #   deployment_type = direct
+      #   workflow = uat=uatdeploy.yml|prod=proddeploy.yml
+      #
+      # Template example:
+      #
+      #   deployment_type = template
+      #   workflow = dev=non-prod.yml|test=non-prod.yml|uat=non-prod.yml
+      # ---------------------------------------------------------------
+
+      - name: Create Jira releases
+        env:
+          JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
+          JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+          GITHUB_TOKEN: ${{ github.token }}
+
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "========================================"
+          echo "Starting Jira release creation"
+          echo "========================================"
+
+          echo "Repository : ${REPOSITORY}"
+          echo "Version    : ${VERSION}"
+          echo "Tag        : ${TAG}"
+          echo "REF        : ${REF}"
+
+          echo "========================================"
+
+          python create_release.py
