@@ -42,4 +42,3 @@ jobs:
     with:
       release_tag: ${{ github.ref_name }}
       repository: ${{ github.repository }}
-
