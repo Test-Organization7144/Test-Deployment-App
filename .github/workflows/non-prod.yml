@@ -10,7 +10,7 @@ on:
         required: true
         type: choice
         options:
-          - DEV
+          - PROD
           - TEST
           - UAT
 
@@ -22,7 +22,7 @@ jobs:
   run-dev:
     name: DEV Deployment
     if: ${{ inputs.environment == 'DEV' }}
-    uses: Test-Organization7144/Test-CI-Templates/.github/workflows/deploy-dev.yml@main
+    uses: Test-Organization7144/Test-CI-Templates/.github/workflows/deploy-prod.yml@main
     with:
       release_tag: ${{ github.ref_name }}
       repository: ${{ github.repository }}
