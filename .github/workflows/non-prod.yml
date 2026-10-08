@@ -20,8 +20,8 @@ permissions:
 jobs:
 
   run-dev:
-    name: DEV Deployment
-    if: ${{ inputs.environment == 'DEV' }}
+    name: PROD Deployment
+    if: ${{ inputs.environment == 'PROD' }}
     uses: Test-Organization7144/Test-CI-Templates/.github/workflows/deploy-prod.yml@main
     with:
       release_tag: ${{ github.ref_name }}
