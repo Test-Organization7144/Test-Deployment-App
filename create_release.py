@@ -1,4 +1,4 @@
-"""Create Jira releases using GitHub repository custom properties."""
+"""Create Jira releases using GitHub repository custom properties1."""
 
 from __future__ import annotations
 
