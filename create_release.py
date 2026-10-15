@@ -1,11 +1,13 @@
-"""Create Jira releases using GitHub repository custom properties1."""
+"""Create Jira releases using GitHub repository custom properties."""
 
 from __future__ import annotations
 
 import logging
 import os
+import re
 import sys
 from typing import Any
+from urllib.parse import quote, urlsplit
 
 import requests
 from requests import Response
@@ -19,9 +21,7 @@ GITHUB_API_VERSION = "2022-11-28"
 
 JIRA_PROJECTS_PROPERTY = "jira_projects"
 
-# ---------------------------------------------------------------------------
-# Deployment model
-# ---------------------------------------------------------------------------
+# Deployment model and supported repository types.
 #
 # Supported values:
 #
@@ -45,9 +45,7 @@ SUPPORTED_DEPLOYMENT_TYPES = {
 }
 
 
-# ---------------------------------------------------------------------------
-# Workflow configuration
-# ---------------------------------------------------------------------------
+# GitHub workflow custom-property names.
 #
 # Current GitHub Custom Property:
 #
@@ -63,12 +61,10 @@ WORKFLOW_PROPERTY_NAMES = (
 LOGGER = logging.getLogger(__name__)
 
 
-# ---------------------------------------------------------------------------
-# Environment
-# ---------------------------------------------------------------------------
+# Environment loading and validation.
 
 def required_env(name: str) -> str:
-    """Return a required environment variable."""
+    """Return a required environment variable without exposing its value."""
 
     value = os.getenv(name, "").strip()
 
@@ -77,7 +73,27 @@ def required_env(name: str) -> str:
             f"Required environment variable '{name}' is missing or empty."
         )
 
+    if any(ord(character) < 32 for character in value):
+        raise ValueError(
+            f"Environment variable '{name}' must not contain control characters."
+        )
+
     return value
+
+
+def validate_metadata_value(name: str, value: str) -> None:
+    """Reject values that would corrupt the pipe-delimited Jira description."""
+
+    if not value.strip():
+        raise ValueError(f"{name} cannot be empty.")
+
+    if "|" in value:
+        raise ValueError(
+            f"{name} must not contain '|', because it is the Jira metadata delimiter."
+        )
+
+    if any(ord(character) < 32 for character in value):
+        raise ValueError(f"{name} must not contain control characters.")
 
 
 def load_environment() -> dict[str, str]:
@@ -99,14 +115,48 @@ def load_environment() -> dict[str, str]:
         for name in names
     }
 
+    # Validate metadata before it is serialized into the Jira version description.
+    for name in ("VERSION", "TAG", "REPOSITORY", "REF"):
+        validate_metadata_value(name, environment[name])
+
+    # Accept fully qualified Git refs but store the branch or tag name consistently.
+    if environment["REF"].startswith("refs/heads/"):
+        environment["REF"] = environment["REF"][len("refs/heads/"):]
+    elif environment["REF"].startswith("refs/tags/"):
+        environment["REF"] = environment["REF"][len("refs/tags/"):]
+
+    if not environment["REF"] or environment["REF"].startswith("-"):
+        raise ValueError(
+            "REF must be a valid branch or tag name and must not start with '-'."
+        )
+
+    if any(character.isspace() for character in environment["REF"]):
+        raise ValueError(
+            "REF must not contain whitespace. Use a valid branch or tag name."
+        )
+
+    if any(character.isspace() for character in environment["TAG"]):
+        raise ValueError(
+            "TAG must not contain whitespace. Use a valid Git tag name."
+        )
+
     environment["JIRA_URL"] = environment["JIRA_URL"].rstrip("/")
+    jira_url = urlsplit(environment["JIRA_URL"])
+
+    if (
+        jira_url.scheme != "https"
+        or not jira_url.netloc
+        or jira_url.query
+        or jira_url.fragment
+    ):
+        raise ValueError(
+            "JIRA_URL must be an HTTPS base URL without a query string or fragment."
+        )
 
     return environment
 
 
-# ---------------------------------------------------------------------------
-# GitHub
-# ---------------------------------------------------------------------------
+# GitHub API operations.
 
 def parse_repository(repository: str) -> tuple[str, str]:
     """
@@ -128,7 +178,7 @@ def parse_repository(repository: str) -> tuple[str, str]:
             "GitHub repository cannot be empty."
         )
 
-    parts = repository.split("/", 1)
+    parts = repository.split("/")
 
     if len(parts) != 2:
         raise ValueError(
@@ -250,7 +300,7 @@ def get_repository_properties(
 
     url = (
         f"{GITHUB_API_BASE}"
-        f"/repos/{owner}/{repo}/properties/values"
+        f"/repos/{quote(owner, safe='')}/{quote(repo, safe='')}/properties/values"
     )
 
     operation = (
@@ -294,22 +344,48 @@ def get_repository_properties(
 
         if response.status_code == 401:
             raise ValueError(
-                "GitHub authentication failed while reading "
-                "repository custom properties. "
-                "Check GITHUB_TOKEN."
+                "GitHub App installation token authentication failed while "
+                "reading repository custom properties. Check that the GitHub "
+                "App ID and private key are correct, that the App is installed "
+                "on the organization owning the repository, and that the "
+                "workflow passes the generated installation token as GITHUB_TOKEN."
             )
 
         if response.status_code == 403:
+            # GitHub may return 403 when the API rate limit has been exhausted.
+            if response.headers.get("X-RateLimit-Remaining") == "0":
+                raise ValueError(
+                    "GitHub API rate limit exceeded while reading repository "
+                    "properties. Wait for the rate limit to reset and rerun "
+                    "the workflow."
+                )
+
             raise ValueError(
-                "GitHub denied access to repository custom properties. "
-                "Check the GITHUB_TOKEN permissions and organization "
-                "repository access."
+                "GitHub denied access to repository custom properties. Verify "
+                "that the GitHub App is installed on the organization owning "
+                "the repository, that the repository is included in the App "
+                "installation, and that the App has the required repository "
+                "metadata/custom-property access. Also check organization "
+                "policies and the installation token's repository scope."
             )
 
         if response.status_code == 404:
             raise ValueError(
-                f"GitHub repository '{repository}' was not found "
-                "or the token cannot access it."
+                f"GitHub repository '{repository}' was not found or the "
+                "GitHub App installation token cannot access it. Verify the "
+                "repository owner/name, App installation, and repository access."
+            )
+
+        if response.status_code == 429:
+            raise ValueError(
+                "GitHub API rate limit exceeded while reading repository properties. "
+                "Wait and rerun the workflow."
+            )
+
+        if response.status_code >= 500:
+            raise ValueError(
+                f"GitHub API is temporarily unavailable (HTTP {response.status_code}). "
+                "Retry the workflow later."
             )
 
         response.raise_for_status()
@@ -369,9 +445,7 @@ def get_property_value(
     return value
 
 
-# ---------------------------------------------------------------------------
-# Deployment type / repository model
-# ---------------------------------------------------------------------------
+# Deployment type configuration.
 
 def get_deployment_type(
     properties: dict[str, Any],
@@ -397,15 +471,9 @@ def get_deployment_type(
         deployment_type = template
     """
 
-    # ---------------------------------------------------------------
-    # Backward compatibility:
-    #
-    # Existing repositories do not need to add deployment_type.
-    # They automatically remain "direct".
-    # ---------------------------------------------------------------
+    # Backward compatibility: existing repositories default to direct.
 
     if DEPLOYMENT_TYPE_PROPERTY not in properties:
-
         LOGGER.info(
             "Custom property '%s' is not configured for repository "
             "'%s'. Defaulting deployment type to '%s'.",
@@ -432,7 +500,6 @@ def get_deployment_type(
     # GitHub custom properties may be returned as strings.
     # Handle a list defensively as well.
     if isinstance(value, list):
-
         if not value:
             return DEPLOYMENT_TYPE_DIRECT
 
@@ -467,9 +534,7 @@ def get_deployment_type(
     return deployment_type
 
 
-# ---------------------------------------------------------------------------
-# Jira project configuration from GitHub custom properties
-# ---------------------------------------------------------------------------
+# Jira project configuration from repository properties.
 
 def get_jira_projects(
     properties: dict[str, Any],
@@ -490,15 +555,12 @@ def get_jira_projects(
     )
 
     if isinstance(value, list):
-
         projects = [
             str(project).strip()
             for project in value
             if str(project).strip()
         ]
-
     else:
-
         projects = [
             project.strip()
             for project in str(value).split(",")
@@ -512,6 +574,22 @@ def get_jira_projects(
             f"'{repository}'."
         )
 
+    invalid_projects = [
+        project for project in projects
+        if not re.fullmatch(r"[A-Z][A-Z0-9_]*", project)
+    ]
+
+    if invalid_projects:
+        raise ValueError(
+            "Invalid Jira project key(s): " + ", ".join(invalid_projects) + ". "
+            "Use uppercase letters, numbers, and underscores, starting with a letter."
+        )
+
+    if len(set(projects)) != len(projects):
+        raise ValueError(
+            f"Duplicate Jira project keys are configured for repository '{repository}'."
+        )
+
     LOGGER.info(
         "Jira projects: %s",
         ", ".join(projects),
@@ -520,9 +598,7 @@ def get_jira_projects(
     return projects
 
 
-# ---------------------------------------------------------------------------
-# Workflow configuration from GitHub custom properties
-# ---------------------------------------------------------------------------
+# Workflow configuration from repository properties.
 
 def get_workflows(
     properties: dict[str, Any],
@@ -572,22 +648,11 @@ def get_workflows(
     is also accepted.
     """
 
-    # ---------------------------------------------------------------
-    # Find the workflow property.
-    #
-    # Preferred/current name:
-    #
-    #     workflow
-    #
-    # Backward-compatible name:
-    #
-    #     workflows
-    # ---------------------------------------------------------------
+    # Find the preferred workflow property or its backward-compatible name.
 
     property_name: str | None = None
 
     for candidate in WORKFLOW_PROPERTY_NAMES:
-
         if candidate in properties:
             property_name = candidate
             break
@@ -612,12 +677,9 @@ def get_workflows(
         property_name,
     )
 
-    # ---------------------------------------------------------------
     # Handle list values defensively.
-    # ---------------------------------------------------------------
 
     if isinstance(value, list):
-
         value = "|".join(
             str(item).strip()
             for item in value
@@ -634,77 +696,66 @@ def get_workflows(
 
     result: dict[str, str] = {}
 
-    # ---------------------------------------------------------------
-    # Environment-specific format:
-    #
-    # uat=uatdeploy.yml|prod=proddeploy.yml
-    #
-    # OR template:
-    #
-    # dev=non-prod.yml|test=non-prod.yml|uat=non-prod.yml
-    # ---------------------------------------------------------------
+    # Parse environment-specific workflow mappings.
 
     if "=" in value:
-
         mappings = value.split("|")
 
         for mapping in mappings:
-
             mapping = mapping.strip()
 
             if not mapping:
-                continue
-
-            if "=" not in mapping:
-
-                LOGGER.warning(
-                    "Ignoring invalid workflow mapping '%s' "
-                    "for repository '%s'.",
-                    mapping,
-                    repository,
+                raise ValueError(
+                    f"Empty workflow mapping in custom property '{property_name}' "
+                    f"for repository '{repository}'. Remove extra '|' separators."
                 )
 
-                continue
+            if "=" not in mapping:
+                raise ValueError(
+                    f"Invalid workflow mapping '{mapping}' for repository '{repository}'. "
+                    "Expected environment=workflow.yml."
+                )
 
-            environment, workflow = mapping.split(
-                "=",
-                1,
-            )
+            environment, workflow = mapping.split("=", 1)
 
             environment = environment.strip().lower()
             workflow = workflow.strip()
 
             if not environment:
-
-                LOGGER.warning(
-                    "Ignoring workflow mapping with empty "
-                    "environment for repository '%s'.",
-                    repository,
+                raise ValueError(
+                    f"Workflow mapping '{mapping}' has an empty environment "
+                    f"for repository '{repository}'."
                 )
-
-                continue
 
             if not workflow:
-
-                LOGGER.warning(
-                    "Ignoring workflow mapping with empty workflow "
-                    "for environment '%s' in repository '%s'.",
-                    environment,
-                    repository,
+                raise ValueError(
+                    f"Workflow mapping for environment '{environment}' has an empty "
+                    f"workflow in repository '{repository}'."
                 )
 
-                continue
+            if not re.fullmatch(r"[a-z0-9][a-z0-9_-]*", environment):
+                raise ValueError(
+                    f"Invalid workflow environment '{environment}' for repository "
+                    f"'{repository}'. Use lowercase letters, numbers, '_' or '-'."
+                )
+
+            if "/" in workflow or "\\" in workflow or workflow in {".", ".."}:
+                raise ValueError(
+                    f"Invalid workflow filename '{workflow}' for environment "
+                    f"'{environment}'. Configure a workflow filename such as 'deploy.yml'."
+                )
+
+            if environment in result:
+                raise ValueError(
+                    f"Duplicate workflow environment '{environment}' is configured "
+                    f"for repository '{repository}'."
+                )
 
             result[environment] = workflow
 
-    # ---------------------------------------------------------------
-    # Single workflow format:
-    #
-    # deploy1.yml
-    # ---------------------------------------------------------------
+    # Support a single workflow filename for direct deployments.
 
     else:
-
         result["default"] = value
 
     if not result:
@@ -718,17 +769,14 @@ def get_workflows(
         "Deployment workflows: %s",
         ", ".join(
             f"{environment}={workflow}"
-            for environment, workflow
-            in sorted(result.items())
+            for environment, workflow in sorted(result.items())
         ),
     )
 
     return result
 
 
-# ---------------------------------------------------------------------------
-# Jira
-# ---------------------------------------------------------------------------
+# Jira API operations.
 
 def create_jira_session(
     email: str,
@@ -814,15 +862,12 @@ def json_object(
 
     try:
         data = response.json()
-
     except ValueError as exc:
-
         raise ValueError(
             f"Invalid JSON returned by {operation}."
         ) from exc
 
     if not isinstance(data, dict):
-
         raise ValueError(
             f"Unexpected response returned by {operation}."
         )
@@ -844,16 +889,41 @@ def get_jira_project(
     response = jira_request(
         session,
         "GET",
-        f"{jira_url}/rest/api/3/project/{project_key}",
+        f"{jira_url}/rest/api/3/project/{quote(project_key, safe='')}",
         operation,
     )
 
     if not response.ok:
+        log_api_error(response, operation)
 
-        log_api_error(
-            response,
-            operation,
-        )
+        if response.status_code == 401:
+            raise ValueError(
+                "Jira authentication failed while looking up project "
+                f"'{project_key}'. Check JIRA_EMAIL and JIRA_API_TOKEN."
+            )
+
+        if response.status_code == 403:
+            raise ValueError(
+                f"Jira denied access to project '{project_key}'. "
+                "Check the Jira account's project permissions."
+            )
+
+        if response.status_code == 404:
+            raise ValueError(
+                f"Jira project '{project_key}' was not found. "
+                "Check the jira_projects custom property and Jira project key."
+            )
+
+        if response.status_code == 429:
+            raise ValueError(
+                "Jira API rate limit exceeded. Wait and rerun the workflow."
+            )
+
+        if response.status_code >= 500:
+            raise ValueError(
+                f"Jira API is temporarily unavailable (HTTP {response.status_code}). "
+                "Retry the workflow later."
+            )
 
         response.raise_for_status()
 
@@ -863,9 +933,7 @@ def get_jira_project(
     )
 
 
-# ---------------------------------------------------------------------------
-# Jira version / release
-# ---------------------------------------------------------------------------
+# Jira release creation and duplicate handling.
 
 def is_duplicate_version(
     response: Response,
@@ -929,7 +997,6 @@ def create_jira_version(
     )
 
     if response.ok:
-
         return (
             "created",
             json_object(
@@ -939,7 +1006,6 @@ def create_jira_version(
         )
 
     if is_duplicate_version(response):
-
         LOGGER.warning(
             "Release '%s' already exists in Jira project '%s'. "
             "Skipping this project and continuing.",
@@ -949,10 +1015,36 @@ def create_jira_version(
 
         return "exists", None
 
-    log_api_error(
-        response,
-        operation,
-    )
+    log_api_error(response, operation)
+
+    if response.status_code == 401:
+        raise ValueError(
+            f"Jira authentication failed while creating release '{version}' "
+            f"in project '{project_key}'. Check JIRA_EMAIL and JIRA_API_TOKEN."
+        )
+
+    if response.status_code == 403:
+        raise ValueError(
+            f"Jira denied permission to create release '{version}' "
+            f"in project '{project_key}'. Check project permissions."
+        )
+
+    if response.status_code == 404:
+        raise ValueError(
+            f"Jira endpoint or project '{project_key}' was not found while "
+            f"creating release '{version}'. Verify the Jira URL and project access."
+        )
+
+    if response.status_code == 429:
+        raise ValueError(
+            "Jira API rate limit exceeded while creating a release. Retry later."
+        )
+
+    if response.status_code >= 500:
+        raise ValueError(
+            f"Jira API is temporarily unavailable (HTTP {response.status_code}) "
+            "while creating a release. Retry later."
+        )
 
     response.raise_for_status()
 
@@ -961,9 +1053,7 @@ def create_jira_version(
     )
 
 
-# ---------------------------------------------------------------------------
-# Jira release description
-# ---------------------------------------------------------------------------
+# Jira release metadata serialization.
 
 def build_release_description(
     environment: dict[str, str],
@@ -997,8 +1087,7 @@ def build_release_description(
 
     workflow_text = ",".join(
         f"{environment_name}:{workflow}"
-        for environment_name, workflow
-        in sorted(workflows.items())
+        for environment_name, workflow in sorted(workflows.items())
     )
 
     return (
@@ -1011,9 +1100,7 @@ def build_release_description(
     )
 
 
-# ---------------------------------------------------------------------------
-# Process Jira project
-# ---------------------------------------------------------------------------
+# Per-project release processing.
 
 def process_project(
     session: requests.Session,
@@ -1040,18 +1127,13 @@ def process_project(
     )
 
     try:
-
         project_id = int(project["id"])
-
     except KeyError as exc:
-
         raise ValueError(
             f"Jira project '{project_key}' response does not contain "
             "a project ID."
         ) from exc
-
     except (TypeError, ValueError) as exc:
-
         raise ValueError(
             f"Invalid Jira project ID '{project.get('id')}' "
             f"for project '{project_key}'."
@@ -1077,7 +1159,6 @@ def process_project(
         return status
 
     if release is None:
-
         raise ValueError(
             f"Jira release response for project '{project_key}' "
             "did not contain release data."
@@ -1096,9 +1177,7 @@ def process_project(
     return "created"
 
 
-# ---------------------------------------------------------------------------
-# Logging
-# ---------------------------------------------------------------------------
+# Release configuration and result logging.
 
 def log_configuration(
     environment: dict[str, str],
@@ -1111,8 +1190,7 @@ def log_configuration(
 
     workflow_text = ", ".join(
         f"{environment_name}={workflow}"
-        for environment_name, workflow
-        in sorted(workflows.items())
+        for environment_name, workflow in sorted(workflows.items())
     )
 
     LOGGER.info(
@@ -1177,9 +1255,7 @@ def log_configuration(
     )
 
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
+# Application entry point and orchestration.
 
 def main() -> int:
     """Run the Jira release creation process."""
@@ -1190,10 +1266,7 @@ def main() -> int:
     )
 
     try:
-
-        # ---------------------------------------------------------------
-        # 1. Load GitHub Actions environment
-        # ---------------------------------------------------------------
+        # Load and validate workflow inputs and credentials.
 
         environment = load_environment()
 
@@ -1201,58 +1274,43 @@ def main() -> int:
             "Starting Jira release creation."
         )
 
-        # ---------------------------------------------------------------
-        # 2. Create GitHub API session
-        # ---------------------------------------------------------------
+        # Initialize authenticated GitHub API access using the supplied token.
+        # In GitHub Actions, GITHUB_TOKEN should contain the generated App
+        # installation token, not a Personal Access Token.
 
         github_session = create_github_session(
             environment["GITHUB_TOKEN"],
         )
 
-        # ---------------------------------------------------------------
-        # 3. Read GitHub custom properties
-        # ---------------------------------------------------------------
+        # Load repository-level deployment configuration.
 
         properties = get_repository_properties(
             github_session,
             environment["REPOSITORY"],
         )
 
-        # ---------------------------------------------------------------
-        # 4. Read deployment type
-        #
-        # If deployment_type is not configured, get_deployment_type()
-        # automatically returns "direct".
-        #
-        # This preserves all existing repositories.
-        # ---------------------------------------------------------------
+        # Resolve direct or template deployment mode with a direct default.
 
         deployment_type = get_deployment_type(
             properties,
             environment["REPOSITORY"],
         )
 
-        # ---------------------------------------------------------------
-        # 5. Read Jira projects
-        # ---------------------------------------------------------------
+        # Resolve the Jira projects configured for this repository.
 
         projects = get_jira_projects(
             properties,
             environment["REPOSITORY"],
         )
 
-        # ---------------------------------------------------------------
-        # 6. Read workflows
-        # ---------------------------------------------------------------
+        # Resolve environment-to-workflow mappings from custom properties.
 
         workflows = get_workflows(
             properties,
             environment["REPOSITORY"],
         )
 
-        # ---------------------------------------------------------------
-        # 7. Build Jira release description
-        # ---------------------------------------------------------------
+        # Serialize release metadata for the Jira version description.
 
         description = build_release_description(
             environment,
@@ -1260,9 +1318,7 @@ def main() -> int:
             workflows,
         )
 
-        # ---------------------------------------------------------------
-        # 8. Log configuration
-        # ---------------------------------------------------------------
+        # Log the resolved release configuration for auditability.
 
         log_configuration(
             environment,
@@ -1272,9 +1328,7 @@ def main() -> int:
             description,
         )
 
-        # ---------------------------------------------------------------
-        # 9. Create Jira API session
-        # ---------------------------------------------------------------
+        # Initialize authenticated Jira API access.
 
         jira_session = create_jira_session(
             environment["JIRA_EMAIL"],
@@ -1284,12 +1338,9 @@ def main() -> int:
         created: list[str] = []
         existing: list[str] = []
 
-        # ---------------------------------------------------------------
-        # 10. Create release in every configured Jira project
-        # ---------------------------------------------------------------
+        # Create the release in each configured Jira project.
 
         for project in projects:
-
             status = process_project(
                 session=jira_session,
                 jira_url=environment["JIRA_URL"],
@@ -1299,16 +1350,11 @@ def main() -> int:
             )
 
             if status == "created":
-
                 created.append(project)
-
             else:
-
                 existing.append(project)
 
-        # ---------------------------------------------------------------
-        # 11. Final result
-        # ---------------------------------------------------------------
+        # Report created and already-existing releases.
 
         LOGGER.info(
             "========================================"
@@ -1340,28 +1386,43 @@ def main() -> int:
         return 0
 
     except ValueError as exc:
-
         LOGGER.error(
             "%s",
             exc,
         )
 
     except requests.HTTPError as exc:
+        # Keep HTTP failures actionable without logging credentials or headers.
+        status_code = (
+            exc.response.status_code
+            if exc.response is not None
+            else "unknown"
+        )
+        LOGGER.error(
+            "API request failed with HTTP status %s: %s",
+            status_code,
+            exc,
+        )
 
+    except requests.Timeout:
+        LOGGER.error(
+            "An API request timed out after %s seconds. Check connectivity and retry.",
+            REQUEST_TIMEOUT,
+        )
+
+    except requests.ConnectionError as exc:
+        LOGGER.error(
+            "Could not connect to GitHub or Jira API: %s",
+            exc,
+        )
+
+    except requests.RequestException as exc:
         LOGGER.error(
             "API request failed: %s",
             exc,
         )
 
-    except requests.RequestException as exc:
-
-        LOGGER.error(
-            "API connection failed: %s",
-            exc,
-        )
-
     except KeyboardInterrupt:
-
         LOGGER.error(
             "Process interrupted by user."
         )
@@ -1369,7 +1430,6 @@ def main() -> int:
         return 130
 
     except Exception:
-
         LOGGER.exception(
             "Unexpected error while creating Jira releases."
         )
